@@ -1,30 +1,54 @@
-# @pipeworx/mcp-patents
+# mcp-patents
 
-MCP server for US patent search and inventor lookup via the [PatentsView API](https://api.patentsview.org/). Free, no authentication required.
+Patents MCP — wraps PatentsView API (https://api.patentsview.org/)
+
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 250+ live data sources.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `search_patents` | Search US patents by keyword (matches patent abstracts) |
-| `get_patent` | Get full details for a specific patent by number |
-| `search_inventors` | Search patent inventors by last name |
 
-## Quickstart via Pipeworx Gateway
+## Quick Start
 
-```bash
-curl -X POST https://gateway.pipeworx.io/mcp \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "patents__search_patents",
-      "arguments": { "query": "machine learning", "per_page": 5 }
-    },
-    "id": 1
-  }'
+Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
+
+```json
+{
+  "mcpServers": {
+    "patents": {
+      "url": "https://gateway.pipeworx.io/patents/mcp"
+    }
+  }
+}
 ```
+
+Or connect to the full Pipeworx gateway for access to all 250+ data sources:
+
+```json
+{
+  "mcpServers": {
+    "pipeworx": {
+      "url": "https://gateway.pipeworx.io/mcp"
+    }
+  }
+}
+```
+
+## Using with ask_pipeworx
+
+Instead of calling tools directly, you can ask questions in plain English:
+
+```
+ask_pipeworx({ question: "your question about Patents data" })
+```
+
+The gateway picks the right tool and fills the arguments automatically.
+
+## More
+
+- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [pipeworx.io](https://pipeworx.io)
 
 ## License
 
