@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-patents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Patents MCP — wraps the USPTO Open Data Portal (ODP) Patent File Wrapper API",
   "type": "module",
   "main": "src/index.ts",
