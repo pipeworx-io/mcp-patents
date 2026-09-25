@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/patents",
   "title": "Patents",
   "description": "Patents MCP — wraps the USPTO Open Data Portal (ODP) Patent File Wrapper API",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "websiteUrl": "https://pipeworx.io/packs/patents",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-patents",

@@ -2,7 +2,7 @@
 
 The US Patent and Trademark Office's patent database via the USPTO Open Data Portal (ODP, `data.uspto.gov`) — Pipeworx migrated off the legacy PatentsView API (`api.patentsview.org`, sunset 2025-05-01) on 2026-05-12. Search and retrieve granted US patents and published applications by keyword, assignee, inventor, or patent number. Free, no auth (platform key configured server-side; bring your own via `_apiKey` if you need your own quota — get one at https://data.uspto.gov/myodp).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
 
 ## Why this matters for AI agents
 
@@ -50,6 +50,8 @@ There's no dedicated `type` input filter — every result carries a `type` field
 - **No citation data.** This pack does not surface citation counts or citation lists at all — there is no way to rank "most-cited" or "foundational" patents within a result set through this pack.
 - **This pack is US-only, but Pipeworx isn't.** USPTO covers US filings only. For European patents, the [`epo-ops`](../epo-ops/README.md) pack is live today — `epo_ops_search_patents`, `get_biblio`, `get_family`, `get_abstract`, `get_claims` against the EPO's worldwide register (verified live 2026-09-08: `epo_ops_search_patents({query:"lithium battery"})` returned current European filings, including publications dated this week). Japanese (JPO) and Chinese (CNIPA) national filings are not in Pipeworx yet — file via [`pipeworx_feedback`](/docs/concepts/meta-tools) if you need them.
 - **Application vs. issued.** "Patent pending" applications are searchable but the date you care about is `grant_date`, not `filing_date`. Applications can be rejected or amended; the issued patent is what matters.
+- **"Filed" wants `filed_after`/`filed_before`, not `granted_after`/`granted_before` (fleet #2418).** A question that says FILED or APPLIED FOR — even when it also says "recent" or "last N years" — wants the filing-date bound; the default application corpus already includes both pending and granted patents, so `filed_after` alone answers it. Using `granted_after` for a filing-activity question silently restricts to already-issued patents, and since grant typically lags filing by 2+ years, a recent granted-only window is usually empty even when real filing activity exists — `search_patents` returns a `date_field_hint` explaining this on a granted-only zero result.
+- **Multi-phrase queries get one zero-result broadening retry (fleet #2418).** `{query: '"residual cancer" "cell-free RNA"'}` requires BOTH exact phrases to co-occur (ODP ANDs every clause), which returned 0 even though "cell-free RNA" alone matches plenty. On a genuine zero with 2+ quoted phrases, `search_patents` automatically retries the same phrases OR'd together and marks the response `broadened: true` — treat those results as "mentions at least one phrase", not all of them. An ordinary bare multi-keyword AND (no quoted phrases) is left alone on zero, since that AND is usually doing real, intentional narrowing.
 - **No patent-family data in this pack.** Unlike `epo-ops`'s `get_family` (INPADOC family, worldwide), this USPTO pack does not return family-member data — `get_patent` covers a single US application/grant only. For "does this invention have foreign counterparts," go through `epo-ops` instead.
 
 ## Quick Start
@@ -96,7 +98,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1683+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -105,7 +107,7 @@ reaches all of them from either one.
 ```bash
 curl -X POST https://gateway.pipeworx.io/v1/tools/patents_search_patents \
   -H 'Content-Type: application/json' \
-  -d '{"query":"machine learning neural networks"}'
+  -d '{"query":"\"cell-free RNA\"","filed_after":"2023-09-25","filed_before":"2026-09-25"}'
 ```
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/patents_search_patents`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.

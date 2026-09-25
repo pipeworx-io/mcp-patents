@@ -932,14 +932,14 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'search_patents',
     description:
-      'Search USPTO patent applications and grants — **without a `granted_after`/`granted_before` bound this returns the APPLICATION corpus sorted newest-FILED-first, not issued patents.** USPTO publishes an application ~18 months after filing and typically takes 2+ years to grant it, so the newest rows in an unfiltered search are always recent, unexamined filings with `grant_date: null` — that is expected, not stale data. If the caller wants "latest patents" meaning issued/granted patents, pass `granted_after` (e.g. "2024-01-01") — it filters to issued patents and every returned row carries a real `grant_date`. Use `query` for free-text keywords ("lithium battery", "crispr", "machine learning"); all terms are required (AND), and you can quote a phrase to keep it together. Optional structured filters: `applicant` (exact corporate name as filed, e.g. "APPLE INC."), `inventor` (person name), `title` (words in the invention title), `number` (a specific application number), `filed_after` / `filed_before`, `granted_after` / `granted_before`. Common synonyms are understood — `assignee`, `company` and `owner` all reach `applicant`, and `keywords`, `q` or `text` all reach `query`. Results include title, application number, filing date, first applicant, all applicants, inventors, status, classification. `total` is the full match count but USPTO returns at most 25 records per search — narrow with applicant or a date range rather than raising `limit`. Powered by the USPTO Open Data Portal (data.uspto.gov).',
+      'Search USPTO patent applications and grants — **without a `granted_after`/`granted_before` bound this returns the APPLICATION corpus sorted newest-FILED-first, not issued patents.** USPTO publishes an application ~18 months after filing and typically takes 2+ years to grant it, so the newest rows in an unfiltered search are always recent, unexamined filings with `grant_date: null` — that is expected, not stale data. **Pick the date field on the QUESTION\'S VERB, not on the word "recent":** a question asking who has FILED / applied for / sought patents in a window wants `filed_after`/`filed_before` — the default application corpus already includes pending AND granted patents, so no `granted_after` is needed or wanted, and adding one will silently drop recently-filed-but-not-yet-examined applications (grant lags filing by 2+ years, so "filed in the last 3 years" AND "granted in the last 3 years" are mostly DISJOINT sets). Only use `granted_after`/`granted_before` when the question explicitly says GRANTED / ISSUED / APPROVED / "has a patent" (not just "recent patents"). Use `query` for free-text keywords ("lithium battery", "crispr", "machine learning"); all terms are required (AND), and you can quote a phrase to keep it together. A question that names several DISTINCT ways of describing the same idea (e.g. a condition plus a detection method, each expressed as its own quoted phrase) should still be passed as one query — if the literal AND-of-everything match returns zero, the tool automatically retries once with those same quoted phrases OR\'d together instead and marks the response `broadened: true`; it never invents synonyms and it only ever relaxes multi-phrase AND to OR on a genuine zero, so a search that is narrow for a real reason (e.g. one specific applicant with no matching filings, or an ordinary bare-keyword AND) still correctly returns zero. Optional structured filters: `applicant` (exact corporate name as filed, e.g. "APPLE INC."), `inventor` (person name), `title` (words in the invention title), `number` (a specific application number), `filed_after` / `filed_before`, `granted_after` / `granted_before`. Common synonyms are understood — `assignee`, `company` and `owner` all reach `applicant`, and `keywords`, `q` or `text` all reach `query`. Results include title, application number, filing date, first applicant, all applicants, inventors, status, classification. `total` is the full match count but USPTO returns at most 25 records per search — narrow with applicant or a date range rather than raising `limit`. Powered by the USPTO Open Data Portal (data.uspto.gov).',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
           description:
-            'Free-text keywords. Every term must appear (they are AND-ed), so add words to narrow and remove words to widen. Wrap words in double quotes to require them adjacent: `"machine learning" model` needs the exact phrase plus the word model. Examples: "lithium battery", "crispr", "neural network". Pass "*" if you only want to filter by applicant/date with no keyword constraint.',
+            'Free-text keywords. Every term must appear (they are AND-ed), so add words to narrow and remove words to widen. Wrap words in double quotes to require them adjacent: `"machine learning" model` needs the exact phrase plus the word model. Examples: "lithium battery", "crispr", "neural network". Pass "*" if you only want to filter by applicant/date with no keyword constraint. If several quoted phrases ANDed together match nothing, the tool retries once with them OR\'d instead (see `broadened` in the response) rather than returning a bare zero.',
         },
         applicant: {
           type: 'string',
@@ -959,15 +959,15 @@ const tools: McpToolExport['tools'] = [
         },
         filed_after: {
           type: 'string',
-          description: 'Optional. Filter to patents filed on/after this date (ISO YYYY-MM-DD).',
+          description: 'Optional. Filter to patents FILED on/after this date (ISO YYYY-MM-DD). Use this for "who has filed / applied for patents on X (recently / in the last N years)" — it covers both pending applications and already-granted patents, so it is the right bound even when the question also says "recent". Do NOT substitute `granted_after` for a filing-activity question: grant lags filing by 2+ years, so a recent filing window under `granted_after` typically returns zero even when filing activity is real.',
         },
         filed_before: {
           type: 'string',
-          description: 'Optional. Filter to patents filed on/before this date (ISO YYYY-MM-DD).',
+          description: 'Optional. Filter to patents FILED on/before this date (ISO YYYY-MM-DD).',
         },
         granted_after: {
           type: 'string',
-          description: 'Optional. Filter to patents GRANTED (issued) on/after this date (ISO YYYY-MM-DD). This is the argument that answers "recent/latest patents" — without it, results are unexamined applications, not issued patents. Accepted synonym: `issued_after`.',
+          description: 'Optional. Filter to patents GRANTED (issued) on/after this date (ISO YYYY-MM-DD) — use ONLY when the question explicitly says GRANTED / ISSUED / APPROVED, not for a plain "recent patents" or "who has filed" question (use `filed_after` for those — see its description). Accepted synonym: `issued_after`.',
         },
         granted_before: {
           type: 'string',
@@ -1074,18 +1074,23 @@ async function searchPatents(args: Record<string, unknown>) {
   const title = pickArg(args, ALIASES.title);
   const number = pickArg(args, ALIASES.number);
 
-  const parts: string[] = [];
-  if (query && query !== '*') parts.push(...composeFreeText(query));
-  if (title) parts.push(`${FIELD_TITLE}:"${title.replace(/"/g, '')}"`);
-  if (applicant) parts.push(`${FIELD_APPLICANT}:"${applicant.replace(/"/g, '')}"`);
-  if (inventor) parts.push(`${FIELD_INVENTOR}:"${inventor.replace(/"/g, '')}"`);
-  if (number) parts.push(`applicationNumberText:${number.replace(/\D/g, '')}`);
+  // Query clauses (free text) are kept SEPARATE from structural filters
+  // (title/applicant/inventor/number/date ranges) so a zero-result retry can
+  // relax only the free-text side — broadening a structural filter like
+  // `applicant` would answer a different question, which is why that stays
+  // untouched below (see `emptyWithFilter`'s own explanation instead).
+  const queryClauses = query && query !== '*' ? composeFreeText(query) : [];
+  const structuralParts: string[] = [];
+  if (title) structuralParts.push(`${FIELD_TITLE}:"${title.replace(/"/g, '')}"`);
+  if (applicant) structuralParts.push(`${FIELD_APPLICANT}:"${applicant.replace(/"/g, '')}"`);
+  if (inventor) structuralParts.push(`${FIELD_INVENTOR}:"${inventor.replace(/"/g, '')}"`);
+  if (number) structuralParts.push(`applicationNumberText:${number.replace(/\D/g, '')}`);
   const filedRange = dateRange(FIELD_FILED, pickArg(args, ALIASES.filed_after), pickArg(args, ALIASES.filed_before));
-  if (filedRange) parts.push(filedRange);
+  if (filedRange) structuralParts.push(filedRange);
   const grantedRange = dateRange(FIELD_GRANTED, pickArg(args, ALIASES.granted_after), pickArg(args, ALIASES.granted_before));
-  if (grantedRange) parts.push(grantedRange);
+  if (grantedRange) structuralParts.push(grantedRange);
 
-  if (parts.length === 0) {
+  if (queryClauses.length === 0 && structuralParts.length === 0) {
     // This threw for 82 calls in 4 days, every one of them the same sentence,
     // which means callers were not arriving empty-handed — they were arriving
     // with `assignee`, `inventor`, `keywords` and other reasonable synonyms this
@@ -1102,19 +1107,57 @@ async function searchPatents(args: Record<string, unknown>) {
       hint: 'Pass free-text keywords as `query` (e.g. {"query": "lithium battery"}), a company as `applicant` in its exact filed form (e.g. "APPLE INC."), or a person as `inventor`.',
     };
   }
-  const composedQ = parts.join(' AND ');
+
+  const composeQ = (clauses: string[]) => [...clauses, ...structuralParts].join(' AND ');
 
   // `size` is not ODP's page-size parameter — it is ignored, and every search
   // returns exactly 25 whatever we ask for. Send it anyway in case they honour
   // it later, but enforce the caller's limit on our side rather than handing
   // back 25 rows to someone who asked for 3.
-  const data = await odpFetch(apiKey, '/applications/search', {
+  let composedQ = composeQ(queryClauses);
+  let data = await odpFetch(apiKey, '/applications/search', {
     q: composedQ,
     size: String(limit),
   });
+  let all = data.patentFileWrapperDataBag ?? [];
+  let total = data.count ?? all.length;
 
-  const all = data.patentFileWrapperDataBag ?? [];
-  const total = data.count ?? all.length;
+  // Zero-result broadening retry (fleet #2418). ODP's query language ANDs
+  // every clause by default — including each quoted phrase in `query` — and a
+  // question that names several DISTINCT ways of describing the same finding
+  // as separate phrases ("residual cancer" AND "cell-free RNA") can genuinely
+  // require ALL of them to co-occur verbatim in one record, which is a much
+  // narrower bar than "patents about this topic". Measured: {query: '"residual
+  // cancer" "cell-free RNA"'} -> 0 (AND of two phrases, neither term alone is
+  // rare). Retrying the SAME phrases OR'd (ODP's default whitespace-join
+  // operator, so simply not inserting "AND" between them) turns that into a
+  // real answer.
+  //
+  // Deliberately gated on >=2 QUOTED phrases, not just >=2 clauses: a bare
+  // multi-word keyword search like {query: "machine learning neural
+  // networks"} is ALSO 4 AND-ed clauses, but that AND is doing real,
+  // intentional work (274 on-topic hits vs 104 for the literal 4-word phrase,
+  // per the composeFreeText comment above) and broadening it to OR would
+  // trade a working narrow search for a noisy one on every ordinary
+  // multi-keyword call. Phrase-vs-phrase is a different shape: each phrase is
+  // already a multi-word concept in its own right, so OR-ing whole concepts
+  // together is a real broadening, not a collapse into single keywords.
+  const quotedPhraseCount = query ? (query.match(/"[^"]+"/g) ?? []).length : 0;
+  let broadened = false;
+  let broadenedFrom: string | null = null;
+  if (total === 0 && queryClauses.length > 1 && quotedPhraseCount >= 2) {
+    broadenedFrom = composedQ;
+    const orClause = `(${queryClauses.join(' ')})`;
+    composedQ = composeQ([orClause]);
+    data = await odpFetch(apiKey, '/applications/search', {
+      q: composedQ,
+      size: String(limit),
+    });
+    all = data.patentFileWrapperDataBag ?? [];
+    total = data.count ?? all.length;
+    broadened = total > 0;
+  }
+
   const records = all.slice(0, limit);
 
   // The old "filter likely missed" heuristic is gone with the syntax that made
@@ -1180,6 +1223,17 @@ async function searchPatents(args: Record<string, unknown>) {
     ...(emptyWithFilter
       ? {
           warning: `No applications matched applicant "${applicant}". ODP matches the corporate name literally, so the exact form on the filing is required — "APPLE INC." matches where "Apple" returns nothing. Try the registered suffix (PBC / Inc. / LLC / Corporation), e.g. "ANTHROPIC PBC" not "ANTHROPIC INC.", "ALPHABET INC." not "GOOGLE".`,
+        }
+      : {}),
+    ...(broadened
+      ? {
+          broadened: true,
+          broadening_note: `The literal query (${broadenedFrom}) matched 0 patents, so this retried the same phrases OR'd together instead of AND'd (${composedQ}). Read these results as "mentions at least one of the phrases", not all of them — narrow again with a more specific query, applicant, or date range if this is too broad.`,
+        }
+      : {}),
+    ...(total === 0 && !broadened && grantedRange && !filedRange
+      ? {
+          date_field_hint: `Zero GRANTED patents matched this window (${grantedRange}). USPTO typically takes 2+ years to examine and grant a filed application, so a recent granted_after/granted_before window often has nothing yet even when filing activity is real. If the question asked about patents FILED (not necessarily granted) in this window, retry with filed_after/filed_before instead — that includes both pending applications and granted patents.`,
         }
       : {}),
     // Dual-shape response: 'results' uses the back-compat shape so callers
