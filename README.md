@@ -1,5 +1,6 @@
 # USPTO Patents — Patent and Application Search
 
+[![AgentHub 已收录：Patents](https://myagenthub.cn/badge/io.github.pipeworx-io/patents)](https://myagenthub.cn/p/io.github.pipeworx-io/patents)
 The US Patent and Trademark Office's patent database via the USPTO Open Data Portal (ODP, `data.uspto.gov`) — Pipeworx migrated off the legacy PatentsView API (`api.patentsview.org`, sunset 2025-05-01) on 2026-05-12. Search and retrieve granted US patents and published applications by keyword, assignee, inventor, or patent number. Free, no auth (platform key configured server-side; bring your own via `_apiKey` if you need your own quota — get one at https://data.uspto.gov/myodp).
 
 Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1684+ live data sources.
