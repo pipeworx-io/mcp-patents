@@ -681,8 +681,13 @@ function collapse(s: string): string {
  *
  * Tools:
  * - search_patents: keyword search across patent applications + grants
- * - get_patent:     fetch a single application/grant by application number
+ * - get_patent:     fetch a single application/grant by application number or patent number
  * - search_inventors: search by inventor name
+ * - get_patent_assignments: per-application assignment history (ODP)
+ * - get_patent_transactions: full prosecution/transaction event history (ODP)
+ * - get_patent_continuity: parent/child continuity chain (ODP)
+ * - search_patent_assignments: assignment search by assignee/assignor/patent/application number
+ *   (USPTO Assignment Search — a separate, keyless public host, not ODP)
  */
 
 
@@ -718,6 +723,9 @@ interface OdpApplicationMetaData {
   applicationStatusDescriptionText?: string;
   applicationStatusDate?: string;
   grantDate?: string;
+  patentNumber?: string;
+  earliestPublicationNumber?: string;
+  earliestPublicationDate?: string;
   applicationTypeCode?: string;
   applicationTypeLabelName?: string;
   firstInventorName?: string;
@@ -772,6 +780,45 @@ interface OdpAssignmentResponse {
   patentFileWrapperDataBag?: Array<{
     applicationNumberText?: string;
     assignmentBag?: OdpAssignment[] | OdpAssignment;
+  }>;
+}
+
+interface OdpTransactionsResponse {
+  count?: number;
+  patentFileWrapperDataBag?: Array<{
+    applicationNumberText?: string;
+    eventDataBag?: OdpEvent[];
+  }>;
+}
+
+interface OdpParentContinuity {
+  childApplicationNumberText?: string;
+  claimParentageTypeCode?: string;
+  claimParentageTypeCodeDescriptionText?: string;
+  parentApplicationFilingDate?: string;
+  parentApplicationNumberText?: string;
+  parentApplicationStatusCode?: number;
+  parentApplicationStatusDescriptionText?: string;
+  parentPatentNumber?: string;
+}
+
+interface OdpChildContinuity {
+  childApplicationFilingDate?: string;
+  childApplicationNumberText?: string;
+  childApplicationStatusCode?: number;
+  childApplicationStatusDescriptionText?: string;
+  childPatentNumber?: string;
+  claimParentageTypeCode?: string;
+  claimParentageTypeCodeDescriptionText?: string;
+  parentApplicationNumberText?: string;
+}
+
+interface OdpContinuityResponse {
+  count?: number;
+  patentFileWrapperDataBag?: Array<{
+    applicationNumberText?: string;
+    parentContinuityBag?: OdpParentContinuity[];
+    childContinuityBag?: OdpChildContinuity[];
   }>;
 }
 
@@ -831,12 +878,20 @@ function formatInventor(inv: OdpInventor): { name: string; first?: string; last?
   return { name, first: inv.firstName, last: inv.lastName };
 }
 
+// fleet #3301: this used to guess a "grant event" by scanning eventDataBag for
+// any description matching /issued|granted|patent.*number/i — which also
+// matches "Request for Extension of Time - Granted" (any routine USPTO
+// extension-of-time approval contains the word "Granted") and that event
+// routinely sorts first, so a caller asking "what's the patent number for
+// application 18926509" got told the application's status was "Patented
+// Case" (true) alongside a misattributed extension-of-time date and NO
+// patent number at all — a 200 that reads as an answer but isn't one.
+// applicationMetaData carries patentNumber / grantDate / the earliest
+// publication directly for a granted case; read those instead of guessing
+// from prosecution event text.
 function formatRecord(r: OdpRecord) {
   const meta = r.applicationMetaData ?? {};
-  // Find a grant event (broadly: anything containing "issued" / "grant" in description)
-  const grantEvent = r.eventDataBag?.find((e) =>
-    /(issued|granted|patent.*number)/i.test(e.eventDescriptionText ?? ''),
-  );
+  const isPatented = meta.applicationStatusDescriptionText === 'Patented Case';
   return {
     application_number: r.applicationNumberText ?? null,
     title: meta.inventionTitle ?? null,
@@ -850,9 +905,21 @@ function formatRecord(r: OdpRecord) {
     first_applicant: meta.firstApplicantName ?? null,
     applicants: (meta.applicantBag ?? []).map((a) => a.applicantNameText ?? null).filter(Boolean),
     classification: meta.class && meta.subclass ? `${meta.class}/${meta.subclass}` : (meta.class ?? null),
-    grant_event: grantEvent
-      ? { description: grantEvent.eventDescriptionText, date: grantEvent.eventDate }
-      : null,
+    // The actual granted-patent identifiers, read straight off applicationMetaData
+    // rather than inferred from prosecution-history text.
+    patent_number: meta.patentNumber ?? null,
+    grant_date: meta.grantDate ?? null,
+    publication_number: meta.earliestPublicationNumber ?? null,
+    publication_date: meta.earliestPublicationDate ?? null,
+    // Loud rather than silent: a "Patented Case" with no patentNumber means
+    // ODP itself omitted the field for this record — say so instead of
+    // quietly returning null the same way a never-granted application would.
+    ...(isPatented && !meta.patentNumber
+      ? {
+          patent_number_warning:
+            'Status is "Patented Case" but USPTO ODP did not include a patentNumber field for this application. This is an upstream data gap, not an unexamined application — do not treat the missing number as "not yet granted".',
+        }
+      : {}),
   };
 }
 
@@ -908,6 +975,7 @@ const FIELD_APPLICANT = 'applicationMetaData.firstApplicantName';
 const FIELD_INVENTOR = 'applicationMetaData.firstInventorName';
 const FIELD_FILED = 'applicationMetaData.filingDate';
 const FIELD_GRANTED = 'applicationMetaData.grantDate';
+const FIELD_PATENT_NUMBER = 'applicationMetaData.patentNumber';
 
 /**
  * Turn free text into an AND of terms, keeping any "quoted phrase" the caller
@@ -1114,20 +1182,23 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_patent',
     description:
-      'Fetch a single USPTO patent application/grant by application number (e.g., "16/123,456" or "16123456"). Returns full metadata: title, inventors, classifications, status, prosecution events. A returned record with no grant event and no grant date is not stale — it means that specific application has not yet been examined/granted; check `status` and `grant_event` rather than assuming the record is out of date.',
+      'Fetch a single USPTO patent application/grant by application number (`number`, e.g. "16/123,456" or "16123456") or by an already-granted patent number (`patent_number`, e.g. "11646472") — pass whichever one you actually have. Returns full metadata: title, inventors, classifications, status, and — when the application has been granted — `patent_number`, `grant_date`, `publication_number`, `publication_date`. **8-digit application numbers and 8-digit patent numbers can be the SAME digit string for a different record** (application series codes 10-12 were used ~2003-2008, and granted patent numbers entered that same 10,000,000-12,999,999 range in 2018 and are still in it) — e.g. "11646472" is BOTH application 11/646,472 (a 2006 filing) AND patent 11,646,472 (a 2023 grant), two unrelated inventions. If you only pass `number` and it is an 8-digit value in that collision range, this tool checks BOTH interpretations; if both exist, it returns `ambiguous: true` with each record summarized rather than silently guessing — re-call with `number` for the application or `patent_number` for the patent. Passing `patent_number` explicitly always skips the ambiguity check. A `status` of "Patented Case" with `patent_number: null` means USPTO ODP omitted that field for this record (check `patent_number_warning`), not that the patent was never granted; a pending application correctly has `patent_number: null`, `grant_date: null`.',
     inputSchema: {
       type: 'object',
       properties: {
         number: {
           type: 'string',
-          description: 'Application number (digits only or with slashes). Examples: "16123456", "16/123,456".',
+          description: 'An application number, digits only or with slashes (e.g. "16123456", "16/123,456"). If this happens to also be a valid 8-digit granted patent number (see the collision note above), the response may come back `ambiguous: true` — pass `patent_number` instead to mean the patent unambiguously.',
+        },
+        patent_number: {
+          type: 'string',
+          description: 'An already-granted US patent number, digits only (e.g. "11646472", "10000000"). Use this instead of `number` whenever you specifically mean the patent, not the application — it is never ambiguous.',
         },
         _apiKey: {
           type: 'string',
           description: 'USPTO ODP API key. Get free at https://data.uspto.gov/myodp.',
         },
       },
-      required: ['number'],
     },
   },
   {
@@ -1181,6 +1252,116 @@ const tools: McpToolExport['tools'] = [
         source: { type: 'string' },
       },
       required: ['application_number', 'count', 'assignments', 'interpretation', 'source'],
+    },
+  },
+  {
+    name: 'get_patent_transactions',
+    description:
+      'Fetch the full USPTO prosecution/transaction history for one patent application — every dated event the Office recorded against the case (filings, mailings, fee payments, office actions, notices, the grant itself), newest first. This is a superset of the handful of events `get_patent` surfaces: use this tool when the question is about the PROSECUTION HISTORY itself (how many office actions, when was it mailed, when did examination start) rather than just the current status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        number: {
+          type: 'string',
+          description: 'US application number, digits only or formatted. Examples: "18926509", "16/123,456".',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of events to return, newest first (default 50). The full history is usually under 100 events; a `note` in the response says when more exist than were returned.',
+        },
+        _apiKey: {
+          type: 'string',
+          description: 'USPTO ODP API key. Get free at https://data.uspto.gov/myodp.',
+        },
+      },
+      required: ['number'],
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        application_number: { type: 'string' },
+        total: { type: 'number' },
+        returned: { type: 'number' },
+        events: { type: 'array', items: { type: 'object' } },
+        source: { type: 'string' },
+      },
+      required: ['application_number', 'total', 'returned', 'events', 'source'],
+    },
+  },
+  {
+    name: 'get_patent_continuity',
+    description:
+      'Fetch the parent/child continuity (priority) chain for one patent application — every earlier application this one claims priority from (continuation, divisional, CIP, provisional, etc.) and every later application that in turn claims priority from it, each with the claim type, dates, and the parent/child\'s own patent number where granted. Use this to answer "what did this patent come from" or "what later patents/applications descend from this one". An application with no continuity relationships returns an empty chain on both sides — that is a real, common answer (most applications are standalone filings), not a failure.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        number: {
+          type: 'string',
+          description: 'US application number, digits only or formatted. Examples: "17248024", "16/123,456".',
+        },
+        _apiKey: {
+          type: 'string',
+          description: 'USPTO ODP API key. Get free at https://data.uspto.gov/myodp.',
+        },
+      },
+      required: ['number'],
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        application_number: { type: 'string' },
+        parent_count: { type: 'number' },
+        child_count: { type: 'number' },
+        parents: { type: 'array', items: { type: 'object' } },
+        children: { type: 'array', items: { type: 'object' } },
+        source: { type: 'string' },
+      },
+      required: ['application_number', 'parent_count', 'child_count', 'parents', 'children', 'source'],
+    },
+  },
+  {
+    name: 'search_patent_assignments',
+    description:
+      'Search USPTO-recorded patent assignment/conveyance history by assignee, assignor, a granted patent number, or an application number — one of the four is required. Unlike `get_patent_assignments` (which needs an application number you already have), this answers "what has company X been assigned" or "who assigned patent Y". An `assignee`/`assignor` search returns one row per recorded assignment (reel/frame, conveyance, dates, the other party) and additionally resolves the covered property (application/patent number, title) for each one it returns via a follow-up lookup — capped by `limit` because each one is a separate upstream call. A `patent_number`/`application_number` search returns the full assignment chain for that one property directly. An assignee/assignor with no recorded assignments returns a plain zero with the upstream total, not an error — USPTO assignment coverage is uneven for older or never-assigned properties. Individual (non-corporate) assignee addresses are omitted; company addresses are kept. Powered by the USPTO Assignment Search system (public, no account or key required).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        assignee: {
+          type: 'string',
+          description: 'Company or person the patent was assigned TO (the recipient). Partial/substring match. Example: "Amyris".',
+        },
+        assignor: {
+          type: 'string',
+          description: 'Company or person who assigned the patent AWAY (the inventor or prior owner). Partial/substring match. Example: "Musk"',
+        },
+        patent_number: {
+          type: 'string',
+          description: 'A granted US patent number, digits only. Example: "10000000".',
+        },
+        application_number: {
+          type: 'string',
+          description: 'A US application number, digits only or formatted. Example: "15000001", "15/000,001".',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum assignment records to return (default 10, max 25). For an assignee/assignor search this also bounds the number of follow-up property lookups, so a higher limit costs more upstream calls.',
+        },
+        _apiKey: {
+          type: 'string',
+          description: 'Not used by this tool — USPTO Assignment Search is keyless. Present only for schema parity with the other tools in this pack.',
+        },
+      },
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'object' },
+        total: { type: 'number' },
+        returned: { type: 'number' },
+        assignments: { type: 'array', items: { type: 'object' } },
+        source: { type: 'string' },
+      },
+      required: ['query', 'total', 'returned', 'assignments', 'source'],
     },
   },
 ];
@@ -1437,28 +1618,122 @@ async function searchPatents(args: Record<string, unknown>) {
   };
 }
 
-async function getPatent(args: Record<string, unknown>) {
-  if (typeof args.number !== 'string' || !args.number.trim()) {
-    throw new Error('Required argument "number" is missing or empty. Pass an application number like "16123456" or "16/123,456".');
-  }
-  const apiKey = resolveApiKey(args);
-  // Normalize: strip slashes and commas
-  const clean = args.number.replace(/[/, ]/g, '');
-
+async function odpLookupByApplicationNumber(apiKey: string, clean: string): Promise<OdpRecord | undefined> {
   const data = await odpFetch(apiKey, '/applications/search', {
     q: `applicationNumberText:${clean}`,
     size: '1',
   });
+  return data.patentFileWrapperDataBag?.[0];
+}
 
-  const record = data.patentFileWrapperDataBag?.[0];
+async function odpLookupByPatentNumber(apiKey: string, clean: string): Promise<OdpRecord | undefined> {
+  const data = await odpFetch(apiKey, '/applications/search', {
+    q: `${FIELD_PATENT_NUMBER}:${clean}`,
+    size: '1',
+  });
+  return data.patentFileWrapperDataBag?.[0];
+}
+
+function summarizeForAmbiguity(r: OdpRecord) {
+  const meta = r.applicationMetaData ?? {};
+  return {
+    application_number: r.applicationNumberText ?? null,
+    patent_number: meta.patentNumber ?? null,
+    title: meta.inventionTitle ?? null,
+    status: meta.applicationStatusDescriptionText ?? null,
+    filing_date: meta.filingDate ?? null,
+    grant_date: meta.grantDate ?? null,
+  };
+}
+
+// fleet #3301 follow-up: an 8-digit application number (2-digit series code +
+// 6-digit serial, e.g. "11" + "646472") and an 8-digit GRANTED patent number
+// occupy the exact same digit-string space once patent numbers cross
+// 10,000,000 — series codes 10-12 were issued to real applications
+// ~2003-2008, and patent numbers have been in the 10,000,000-12,999,999 range
+// since 2018 and still are as of this writing. "11646472" is simultaneously
+// application 11/646,472 (a 2006 filing) and patent 11,646,472 (a 2023
+// grant) — two unrelated inventions. The old application-first-then-fallback
+// logic silently returned whichever one matched FIRST (always the
+// application, since that query runs first), which is a wrong answer
+// delivered with full confidence rather than an error. Detect the collision
+// zone and check both interpretations rather than picking one.
+function isCollisionRangeNumber(clean: string): boolean {
+  if (!/^\d{8}$/.test(clean)) return false;
+  const n = Number(clean);
+  return n >= 10_000_000 && n <= 12_999_999;
+}
+
+async function getPatent(args: Record<string, unknown>) {
+  const rawNumber = typeof args.number === 'string' && args.number.trim() ? args.number.trim() : null;
+  const rawPatentNumber = typeof args.patent_number === 'string' && args.patent_number.trim() ? args.patent_number.trim() : null;
+  if (!rawNumber && !rawPatentNumber) {
+    throw new Error('Pass either "number" (an application number like "16123456" or "16/123,456") or "patent_number" (a granted patent number like "11646472").');
+  }
+  const apiKey = resolveApiKey(args);
+
+  // Explicit patent_number always means the PATENT — never ambiguous,
+  // because the caller already disambiguated by which argument they used.
+  if (rawPatentNumber) {
+    const clean = rawPatentNumber.replace(/[/, ]/g, '');
+    const record = await odpLookupByPatentNumber(apiKey, clean);
+    if (!record) {
+      return {
+        found: false,
+        patent_number: rawPatentNumber,
+        hint: 'No granted patent found for that number. Confirm the format (digits only, e.g. "11646472").',
+      };
+    }
+    return { found: true, matched_by: 'patent_number' as const, ...formatRecord(record) };
+  }
+
+  // Only `number` given. Normalize: strip slashes and commas.
+  const clean = rawNumber!.replace(/[/, ]/g, '');
+
+  if (isCollisionRangeNumber(clean)) {
+    const [appRecord, patentRecord] = await Promise.all([
+      odpLookupByApplicationNumber(apiKey, clean),
+      odpLookupByPatentNumber(apiKey, clean),
+    ]);
+    const sameRecord = !!appRecord && !!patentRecord && appRecord.applicationNumberText === patentRecord.applicationNumberText;
+    if (appRecord && patentRecord && !sameRecord) {
+      return {
+        found: true,
+        ambiguous: true,
+        warning: `"${rawNumber}" matches BOTH an application number and a granted patent number — these are two different records. Pass this value as \`number\` to mean the application, or as \`patent_number\` to mean the patent.`,
+        application_match: summarizeForAmbiguity(appRecord),
+        patent_match: summarizeForAmbiguity(patentRecord),
+      };
+    }
+    const record = appRecord ?? patentRecord;
+    const matchedBy: 'application_number' | 'patent_number' = appRecord ? 'application_number' : 'patent_number';
+    if (!record) {
+      return {
+        found: false,
+        application_number: rawNumber,
+        hint: 'No patent application or granted patent found for that number. Confirm the format (digits only, e.g. "16123456" for an application or "11646472" for a granted patent).',
+      };
+    }
+    return { found: true, matched_by: matchedBy, ...formatRecord(record) };
+  }
+
+  // Outside the collision range (the common case — current application
+  // series are 18xxxxxx and well clear of the patent-number range): try
+  // application number first, then retry as a patent number on a miss.
+  let record = await odpLookupByApplicationNumber(apiKey, clean);
+  let matchedBy: 'application_number' | 'patent_number' = 'application_number';
+  if (!record) {
+    record = await odpLookupByPatentNumber(apiKey, clean);
+    matchedBy = 'patent_number';
+  }
   if (!record) {
     return {
       found: false,
-      application_number: args.number,
-      hint: 'No patent application found for that number. Confirm the format (digits only, e.g. "16123456").',
+      application_number: rawNumber,
+      hint: 'No patent application or granted patent found for that number. Confirm the format (digits only, e.g. "16123456" for an application or "11646472" for a granted patent).',
     };
   }
-  return { found: true, ...formatRecord(record) };
+  return { found: true, matched_by: matchedBy, ...formatRecord(record) };
 }
 
 async function searchInventors(args: Record<string, unknown>) {
@@ -1547,6 +1822,327 @@ async function getPatentAssignments(args: Record<string, unknown>) {
   };
 }
 
+async function getPatentTransactions(args: Record<string, unknown>) {
+  if (typeof args.number !== 'string' || !args.number.trim()) {
+    throw new Error('Required argument "number" is missing or empty. Pass an application number like "18926509".');
+  }
+  const applicationNumber = args.number.replace(/\D/g, '');
+  if (applicationNumber.length < 6 || applicationNumber.length > 12) {
+    throw new Error('number must contain 6-12 digits.');
+  }
+  const apiKey = resolveApiKey(args);
+  const limit = Math.min(500, Math.max(1, (args.limit as number | undefined) ?? 50));
+  const data = await odpFetch<OdpTransactionsResponse>(
+    apiKey,
+    `/applications/${applicationNumber}/transactions`,
+    {},
+  );
+  const record = data.patentFileWrapperDataBag?.[0];
+  const all = record?.eventDataBag ?? [];
+  // Newest first: ODP does not document an order guarantee for this bag, and
+  // the live example observed was not reliably sorted — sort explicitly
+  // rather than silently trusting upstream order, same spirit as the
+  // search_patents 25-record-cap note below.
+  const sorted = [...all].sort((a, b) => (b.eventDate ?? '').localeCompare(a.eventDate ?? ''));
+  const events = sorted.slice(0, limit).map((e) => ({
+    event_code: e.eventCode ?? null,
+    description: e.eventDescriptionText ?? null,
+    date: e.eventDate ?? null,
+  }));
+  return {
+    application_number: record?.applicationNumberText ?? applicationNumber,
+    total: all.length,
+    returned: events.length,
+    events,
+    ...(all.length > events.length
+      ? { note: `${all.length} transaction events exist for this application; showing the ${events.length} most recent. Raise \`limit\` to see more.` }
+      : {}),
+    source: 'USPTO Open Data Portal, Patent File Wrapper transaction history',
+  };
+}
+
+async function getPatentContinuity(args: Record<string, unknown>) {
+  if (typeof args.number !== 'string' || !args.number.trim()) {
+    throw new Error('Required argument "number" is missing or empty. Pass an application number like "17248024".');
+  }
+  const applicationNumber = args.number.replace(/\D/g, '');
+  if (applicationNumber.length < 6 || applicationNumber.length > 12) {
+    throw new Error('number must contain 6-12 digits.');
+  }
+  const apiKey = resolveApiKey(args);
+  const data = await odpFetch<OdpContinuityResponse>(
+    apiKey,
+    `/applications/${applicationNumber}/continuity`,
+    {},
+  );
+  const record = data.patentFileWrapperDataBag?.[0];
+  const parents = (record?.parentContinuityBag ?? []).map((p) => ({
+    parent_application_number: p.parentApplicationNumberText ?? null,
+    parent_patent_number: p.parentPatentNumber ?? null,
+    relationship: p.claimParentageTypeCodeDescriptionText ?? p.claimParentageTypeCode ?? null,
+    parent_filing_date: p.parentApplicationFilingDate ?? null,
+    parent_status: p.parentApplicationStatusDescriptionText ?? null,
+  }));
+  const children = (record?.childContinuityBag ?? []).map((c) => ({
+    child_application_number: c.childApplicationNumberText ?? null,
+    child_patent_number: c.childPatentNumber ?? null,
+    relationship: c.claimParentageTypeCodeDescriptionText ?? c.claimParentageTypeCode ?? null,
+    child_filing_date: c.childApplicationFilingDate ?? null,
+    child_status: c.childApplicationStatusDescriptionText ?? null,
+  }));
+  return {
+    application_number: record?.applicationNumberText ?? applicationNumber,
+    parent_count: parents.length,
+    child_count: children.length,
+    parents,
+    children,
+    source: 'USPTO Open Data Portal, Patent File Wrapper continuity data',
+  };
+}
+
+// ── USPTO Assignment Search (keyless, public — distinct host from ODP) ──
+//
+// ODP's own /applications/{n}/assignment route (used by get_patent_assignments
+// above) only accepts an application number you already have. "What has
+// company X been assigned" / "who assigned patent Y away" needs a real search
+// by name or by patent number, which ODP does not expose (confirmed: no
+// /assignment/search route exists on that host — only the per-application
+// one). USPTO's own public Assignment Search front end calls a separate,
+// keyless JSON endpoint to answer exactly this; this wraps that endpoint
+// directly rather than mirroring any dataset (fleet #2944/#2946: provenance
+// here is publisher + dataset, never the route).
+const ASSIGNMENT_SEARCH_BASE = 'https://assignmentcenter.uspto.gov/ipas/search/api/v3/public/search/patent';
+
+interface AcAssignee {
+  assigneeName?: string;
+  addressLine1?: string;
+  addressLine2?: string;
+  addressLine3?: string;
+  addressLine4?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  zipCode?: string;
+}
+interface AcAssignor {
+  assignorName?: string;
+  executionDate?: string;
+  acknowledgedDate?: string | null;
+}
+interface AcProperty {
+  applicationNumber?: string;
+  patentNumber?: string;
+  publicationNumber?: string;
+  inventionTitle?: string;
+  fillingDate?: string; // sic — upstream's own typo'd field name
+  issueDate?: string;
+}
+interface AcAssignmentDetail {
+  reelNumber?: number | string;
+  frameNumber?: number | string;
+  reelFrame?: string;
+  conveyance?: string;
+  recordationDate?: string;
+  mailDate?: string;
+  receiptDate?: string;
+  assignorExecutionDate?: string;
+  assignees?: AcAssignee[];
+  assignors?: AcAssignor[];
+}
+interface AcNameSearchRow {
+  reelNumber?: number;
+  frameNumber?: number;
+  correspondentName?: string;
+  assignorExecutionDate?: string;
+  conveyance?: string;
+  assignors?: AcAssignor[];
+  assignees?: string[]; // name-search mode returns bare assignee name strings
+  noOfProperties?: number;
+}
+
+async function acSearch(body: Record<string, unknown>): Promise<unknown> {
+  const res = await pwFetch(ASSIGNMENT_SEARCH_BASE, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await httpError(res, 'USPTO Assignment Search');
+  return parseJson(res, 'USPTO Assignment Search');
+}
+
+/** Individual (not corporate) assignee names are recorded "LAST, First" —
+ * the same shape as assignor names, which are always natural persons.
+ * Addresses are omitted for those; a company's recorded address is kept. */
+const CORPORATE_SUFFIX_RE = /\b(INC|LLC|LLP|LTD|CORP|CORPORATION|CO|COMPANY|GMBH|AG|SA|SAS|SRL|NV|BV|KK|PBC|PLC|LP|L\.P\.|PARTNERS|UNIVERSITY|FOUNDATION|TRUST|HOLDINGS?|GROUP|LABORATORIES|LABS|PHARMACEUTICALS?|TECHNOLOGIES|SYSTEMS|INDUSTRIES|BIO ?PRODUCTS)\b\.?/i;
+function looksIndividual(name: string | undefined): boolean {
+  if (!name) return false;
+  if (CORPORATE_SUFFIX_RE.test(name)) return false;
+  return /^[A-Za-z'\-. ]+,\s*[A-Za-z]/.test(name.trim());
+}
+
+function formatAcAddress(a: AcAssignee): Record<string, unknown> | null {
+  const parts = [a.addressLine1, a.addressLine2, a.addressLine3, a.addressLine4].filter(Boolean);
+  if (parts.length === 0 && !a.city && !a.state && !a.country) return null;
+  return {
+    lines: parts,
+    city: a.city || null,
+    state: a.state || null,
+    country: a.country || null,
+    zip: a.zipCode || null,
+  };
+}
+
+function formatAcDetail(a: AcAssignmentDetail) {
+  const reel = a.reelNumber != null ? String(a.reelNumber) : null;
+  const frame = a.frameNumber != null ? String(a.frameNumber) : null;
+  return {
+    reel_frame: a.reelFrame ?? (reel && frame ? `${reel}/${frame}` : null),
+    conveyance: a.conveyance ?? null,
+    recorded_date: a.recordationDate ?? null,
+    received_date: a.receiptDate ?? null,
+    mailed_date: a.mailDate ?? null,
+    assignors: (a.assignors ?? []).map((x) => ({ name: x.assignorName ?? null, execution_date: x.executionDate ?? null })),
+    assignees: (a.assignees ?? []).map((x) => ({
+      name: x.assigneeName ?? null,
+      address: looksIndividual(x.assigneeName) ? null : formatAcAddress(x),
+    })),
+  };
+}
+
+function formatAcProperty(p: AcProperty) {
+  return {
+    application_number: p.applicationNumber || null,
+    patent_number: p.patentNumber || null,
+    publication_number: p.publicationNumber || null,
+    title: p.inventionTitle || null,
+    filing_date: p.fillingDate || null,
+    issue_date: p.issueDate || null,
+  };
+}
+
+async function searchPatentAssignments(args: Record<string, unknown>) {
+  const assignee = pickArg(args, ['assignee', 'assignee_name', 'owner']);
+  const assignor = pickArg(args, ['assignor', 'assignor_name']);
+  const patentNumber = pickArg(args, ['patent_number', 'patentNumber'])?.replace(/\D/g, '') || null;
+  const applicationNumber = pickArg(args, ['application_number', 'applicationNumber'])?.replace(/\D/g, '') || null;
+  const limit = Math.min(25, Math.max(1, (args.limit as number | undefined) ?? 10));
+
+  if (!assignee && !assignor && !patentNumber && !applicationNumber) {
+    return {
+      found: false,
+      reason: 'no_search_criteria',
+      message: 'Pass one of: assignee, assignor, patent_number, application_number.',
+      query: {},
+      total: 0,
+      returned: 0,
+      assignments: [],
+      source: 'USPTO Assignment Search',
+    };
+  }
+
+  const query = { assignee, assignor, patent_number: patentNumber, application_number: applicationNumber };
+
+  // Property-identified search (patent/application number): ODP's shape is
+  // one assignment CHAIN for that one property, with the property details
+  // attached directly — no follow-up call needed.
+  if (patentNumber || applicationNumber) {
+    const property = patentNumber ?? applicationNumber;
+    const searchBy = patentNumber ? 'patentNumber' : 'applicationNumber';
+    const raw = (await acSearch({
+      property,
+      searchBy,
+      dataFilter: { rowsPerPage: String(limit), currentPage: '1' },
+    })) as {
+      successResponse?: {
+        data?: { assignment?: AcAssignmentDetail[] | AcAssignmentDetail | null; properties?: AcProperty[] | AcProperty | null; noOfAssignments?: number };
+        totalRows?: number;
+        message?: string;
+      };
+    };
+    const sr = raw.successResponse;
+    const rawAssignment = sr?.data?.assignment;
+    const assignmentList = Array.isArray(rawAssignment) ? rawAssignment : rawAssignment ? [rawAssignment] : [];
+    const rawProps = sr?.data?.properties;
+    const properties = (Array.isArray(rawProps) ? rawProps : rawProps ? [rawProps] : []).map(formatAcProperty);
+    const total = sr?.data?.noOfAssignments ?? assignmentList.length;
+    const assignments = assignmentList.slice(0, limit).map((a) => ({ ...formatAcDetail(a), properties }));
+    return {
+      query,
+      total,
+      returned: assignments.length,
+      assignments,
+      ...(total === 0 ? { note: sr?.message ?? 'No assignment records found for that number.' } : {}),
+      source: 'USPTO Assignment Search',
+    };
+  }
+
+  // Name search (assignee/assignor): the list endpoint returns assignment
+  // summaries WITHOUT the covered property numbers (upstream's own
+  // noOfProperties field was observed 0 on every row regardless of the real
+  // count), so the property identifiers have to come from a follow-up
+  // per-reel/frame lookup — one extra call per returned row, run in parallel
+  // and bounded by `limit` so a caller cannot force an unbounded fan-out.
+  const property = assignee ?? assignor;
+  const searchBy = assignee ? 'partialAssigneeName' : 'partialAssignorName';
+  const raw = (await acSearch({
+    property,
+    searchBy,
+    dataFilter: { rowsPerPage: String(limit), currentPage: '1' },
+  })) as { successResponse?: { data?: AcNameSearchRow[]; totalRows?: number; message?: string } };
+  const sr = raw.successResponse;
+  const allRows = sr?.data ?? [];
+  const total = sr?.totalRows ?? allRows.length;
+  const rows = allRows.slice(0, limit);
+
+  const enriched = await Promise.all(
+    rows.map(async (row) => {
+      const base = {
+        reel_frame: row.reelNumber != null && row.frameNumber != null ? `${row.reelNumber}/${row.frameNumber}` : null,
+        conveyance: row.conveyance ?? null,
+        executed_date: row.assignorExecutionDate ?? null,
+        assignors: (row.assignors ?? []).map((x) => ({ name: x.assignorName ?? null, execution_date: x.executionDate ?? null })),
+        assignees: (row.assignees ?? []).map((name) => ({ name, address: null })), // name-search mode gives bare strings, no address
+      };
+      if (row.reelNumber == null || row.frameNumber == null) {
+        return { ...base, recorded_date: null, properties: [], properties_unavailable: 'reel/frame missing from upstream row' };
+      }
+      try {
+        const detail = (await acSearch({
+          reelNumber: String(row.reelNumber),
+          frameNumber: String(row.frameNumber),
+          searchBy: 'reelFrame',
+          dataFilter: { rowsPerPage: '10', currentPage: '1' },
+        })) as { successResponse?: { data?: { assignment?: AcAssignmentDetail; properties?: AcProperty[] | AcProperty | null } } };
+        const d = detail.successResponse?.data;
+        const rawProps = d?.properties;
+        const properties = (Array.isArray(rawProps) ? rawProps : rawProps ? [rawProps] : []).map(formatAcProperty);
+        return {
+          ...base,
+          recorded_date: d?.assignment?.recordationDate ?? null,
+          properties,
+        };
+      } catch {
+        // A single failed enrichment call should not fail the whole search —
+        // the caller still gets the name-search row, just without the
+        // property numbers for that one entry.
+        return { ...base, recorded_date: null, properties: [], properties_unavailable: 'enrichment lookup failed' };
+      }
+    }),
+  );
+
+  return {
+    query,
+    total,
+    returned: enriched.length,
+    assignments: enriched,
+    ...(total > rows.length
+      ? { note: `USPTO Assignment Search matched ${total} records for this name; returning the first ${rows.length} (raise \`limit\`, max 25, to see more — the upstream search itself is not paginated server-side).` }
+      : {}),
+    ...(total === 0 ? { note: sr?.message ?? 'No assignment records found for that name.' } : {}),
+    source: 'USPTO Assignment Search',
+  };
+}
+
 // ── callTool router ──────────────────────────────────────────────────
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1559,6 +2155,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return searchInventors(args);
     case 'get_patent_assignments':
       return getPatentAssignments(args);
+    case 'get_patent_transactions':
+      return getPatentTransactions(args);
+    case 'get_patent_continuity':
+      return getPatentContinuity(args);
+    case 'search_patent_assignments':
+      return searchPatentAssignments(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
