@@ -2,7 +2,7 @@
 
 The US Patent and Trademark Office's patent database via the USPTO Open Data Portal (ODP, `data.uspto.gov`) — Pipeworx migrated off the legacy PatentsView API (`api.patentsview.org`, sunset 2025-05-01) on 2026-05-12. Search and retrieve granted US patents and published applications by keyword, assignee, inventor, or patent number. Free, no auth (platform key configured server-side; bring your own via `_apiKey` if you need your own quota — get one at https://data.uspto.gov/myodp).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1837+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -14,7 +14,7 @@ Three core flows:
 
 **2. Specific patent.** "What's the status of application 16/123,456?" → `get_patent({number: "16123456"})` → title, inventors, classification, status, and — once granted — `patent_number`/`grant_date`/`publication_number`/`publication_date`. If you already have a GRANTED patent number instead, pass it as `patent_number` (e.g. `get_patent({patent_number: "11646472"})`) rather than `number` — see the collision warning below. For the full prosecution timeline, use `get_patent_transactions`; for where the application came from (continuations, divisionals, provisionals) and what it later spawned, use `get_patent_continuity`. For who currently holds it, pair with `get_patent_assignments({application_number: "16123456"})` or search by name with `search_patent_assignments`.
 
-**3. Ownership search.** "What has Amyris been assigned?" / "Who assigned patent 10,000,000?" → `search_patent_assignments({assignee: "Amyris"})` / `search_patent_assignments({patent_number: "10000000"})` → recorded assignments with reel/frame, conveyance, dates, assignors/assignees, and the covered application/patent numbers.
+**3. Transfer history (not a patent list).** "What has Amyris been assigned?" / "Who assigned patent 10,000,000?" → `search_patent_assignments({assignee: "Amyris"})` / `search_patent_assignments({patent_number: "10000000"})` → recorded assignments with reel/frame, conveyance, dates, assignors/assignees, and the covered application/patent numbers. This is the recorded-transfer register, one row per transfer. To list the patents a company **owns or holds** ("patents assigned to X"), use `search_patents({applicant: "<company name with its corporate suffix>", query: "*"})` instead — a company with no recorded transfer returns zero here even when it holds many patents.
 
 For company-level IP due diligence (combining patents with SEC IP risk disclosures and trademarks), see the [Patent Due Diligence](/docs/recipes/patent-due-diligence) recipe.
 
@@ -104,7 +104,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1837+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -118,10 +118,12 @@ curl -X POST https://gateway.pipeworx.io/v1/tools/patents_search_patents \
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/patents_search_patents`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
-## Standalone (no gateway account)
+## Run it from npm
 
-This package also runs as a local stdio MCP server — no Pipeworx account, no
-gateway round-trip:
+`@pipeworx/mcp-patents` is a local stdio bridge to the Pipeworx gateway: your MCP client
+starts it with `npx`, and it forwards every call to the same
+`https://gateway.pipeworx.io/patents/mcp` endpoint shown above. It needs network access;
+there is no offline mode.
 
 ```json
 {
@@ -134,15 +136,18 @@ gateway round-trip:
 }
 ```
 
-Or run it directly to confirm it starts:
+Without a key it calls anonymously, capped at 50 calls a day. A free account
+raises that to 200 a day: get a key at https://pipeworx.io/signup and add
+`"env": { "PIPEWORX_API_KEY": "<your key>" }` to the server entry.
+The key is sent as a Bearer token, the same way a hosted connection sends it,
+so calls are metered and billed exactly as they are there.
 
-```bash
-npx -y @pipeworx/mcp-patents
-```
+It lists **only** this pack's tools by default. Set `PIPEWORX_META_TOOLS=1` to
+also list `ask_pipeworx` and the other gateway-wide tools.
 
-It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
-for **only** this pack's tools — none of the shared meta-tools the gateway
-connection above adds. Same source, same tools, no ask_pipeworx routing.
+Behind an HTTPS proxy: Node's built-in `fetch` does not read `HTTPS_PROXY` by
+default. Newer Node releases honour it when `NODE_USE_ENV_PROXY=1` is set; check
+your Node version's documentation.
 
 ## Using with ask_pipeworx
 
