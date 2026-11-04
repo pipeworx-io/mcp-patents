@@ -2,7 +2,7 @@
 
 The US Patent and Trademark Office's patent database via the USPTO Open Data Portal (ODP, `data.uspto.gov`) — Pipeworx migrated off the legacy PatentsView API (`api.patentsview.org`, sunset 2025-05-01) on 2026-05-12. Search and retrieve granted US patents and published applications by keyword, assignee, inventor, or patent number. Free, no auth (platform key configured server-side; bring your own via `_apiKey` if you need your own quota — get one at https://data.uspto.gov/myodp).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1867+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -104,7 +104,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1856+ data sources. The
+Both URLs reach the same gateway and the same 1867+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
